@@ -154,3 +154,18 @@ spec:
   selector:
     app: postgres
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-external
+  namespace: default
+spec:
+  type: NodePort
+  ports:
+    - port: 5432
+      targetPort: 5432
+      nodePort: 30032
+      protocol: TCP
+  selector:
+    app: postgres
+---
