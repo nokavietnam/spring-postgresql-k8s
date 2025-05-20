@@ -1,0 +1,156 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-reader-binding
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: default
+data:
+  POSTGRES_DB: "myappdb"
+  POSTGRES_USER: "myappuser"
+  POSTGRES_PASSWORD: "myapppassword"
+  postgresql.conf: |
+    listen_addresses = '*'
+    wal_level = replica
+    max_wal_senders = 5
+    wal_keep_size = 128
+    hot_standby = on
+  pg_hba.conf: |
+    local all all trust
+    host all all 0.0.0.0/0 md5
+    host replication all 0.0.0.0/0 md5
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+  namespace: default
+data:
+  init-replication.sh: |
+    #!/bin/bash
+    HOSTNAME=$(hostname)
+    if [[ $HOSTNAME == *-0 ]]; then
+      echo "This is the master node"
+      psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD 'replicatorpass';
+        SELECT pg_create_physical_replication_slot('replica_slot');
+      EOSQL
+    else
+      echo "This is a replica node"
+      pg_basebackup -h postgres-0.postgres.default.svc.cluster.local -D /var/lib/postgresql/data -U replicator -P --wal-method=stream
+      echo "host replication replicator 0.0.0.0/0 md5" >> /var/lib/postgresql/data/pg_hba.conf
+      echo "standby_mode = 'on'" >> /var/lib/postgresql/data/postgresql.conf
+      echo "primary_conninfo = 'host=postgres-0.postgres.default.svc.cluster.local port=5432 user=replicator password=replicatorpass'" >> /var/lib/postgresql/data/postgresql.conf
+      echo "primary_slot_name = 'replica_slot'" >> /var/lib/postgresql/data/postgresql.conf
+    fi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  serviceName: postgres
+  replicas: 3
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:15
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-config
+                  key: POSTGRES_PASSWORD
+          ports:
+            - containerPort: 5432
+              name: postgres
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-config
+              mountPath: /etc/postgresql
+            - name: init-script
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+              ephemeral-storage: "2Gi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+              ephemeral-storage: "2Gi"
+      volumes:
+        - name: postgres-config
+          configMap:
+            name: postgres-config
+        - name: init-script
+          configMap:
+            name: postgres-init-script
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: "1Gi"
+          limits:
+            storage: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: default
+spec:
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+  selector:
+    app: postgres
+---
